@@ -824,7 +824,11 @@ rdp_input_keyboard_event (rdpInput *rdp_input,
   fullcode = flags & KBD_FLAGS_EXTENDED ? scancode | KBDEXT : scancode;
   vkcode = GetVirtualKeyCodeFromVirtualScanCode (fullcode, keyboard_type);
   vkcode = flags & KBD_FLAGS_EXTENDED ? vkcode | KBDEXT : vkcode;
+
   keycode = GetKeycodeFromVirtualKeyCode (vkcode, WINPR_KEYCODE_TYPE_EVDEV);
+  if (keycode == 0)
+    keycode = GetKeycodeFromVirtualKeyCode (vkcode ^ KBDEXT,
+                                            WINPR_KEYCODE_TYPE_EVDEV);
 
   key_state = flags & KBD_FLAGS_RELEASE ? GRD_KEY_STATE_RELEASED
                                         : GRD_KEY_STATE_PRESSED;
