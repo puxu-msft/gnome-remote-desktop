@@ -1580,6 +1580,23 @@ request_server_format_data (gpointer user_data)
   return G_SOURCE_REMOVE;
 }
 
+static uint32_t
+get_utf8_text_format_id (GrdClipboardRdp *clipboard_rdp)
+{
+  uint32_t format_id;
+
+  /*
+   * Since WinPR 3.32.2, "text/plain" is UTF-escaped text and UTF-8 text is
+   * "text/plain;charset=utf-8". Older versions only know "text/plain".
+   */
+  format_id = ClipboardGetFormatId (clipboard_rdp->system,
+                                    "text/plain;charset=utf-8");
+  if (format_id)
+    return format_id;
+
+  return ClipboardGetFormatId (clipboard_rdp->system, "text/plain");
+}
+
 /**
  * Client knows our format list, it requests now the data from our clipboard
  */
@@ -1610,8 +1627,7 @@ cliprdr_client_format_data_request (CliprdrServerContext              *cliprdr_c
       mime_type = clipboard_rdp->which_unicode_format;
       needs_null_terminator = TRUE;
       needs_conversion = TRUE;
-      src_format_id = ClipboardGetFormatId (clipboard_rdp->system,
-                                            "text/plain");
+      src_format_id = get_utf8_text_format_id (clipboard_rdp);
       break;
     case GRD_CF_HTML:
       mime_type = GRD_MIME_TYPE_TEXT_HTML;
@@ -1824,8 +1840,7 @@ convert_client_content_for_server (GrdClipboardRdp *clipboard_rdp,
     case GRD_MIME_TYPE_TEXT_PLAIN_UTF8:
     case GRD_MIME_TYPE_TEXT_UTF8_STRING:
       is_null_terminated = TRUE;
-      dst_format_id = ClipboardGetFormatId (clipboard_rdp->system,
-                                            "text/plain");
+      dst_format_id = get_utf8_text_format_id (clipboard_rdp);
       break;
     case GRD_MIME_TYPE_TEXT_HTML:
       is_null_terminated = TRUE;
