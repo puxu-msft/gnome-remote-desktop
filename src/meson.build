@@ -410,11 +410,11 @@ executable('gnome-remote-desktop-control',
            include_directories: [configinc],
            install : false)
 
-executable('grdctl',
-           ctl_sources,
-           dependencies: ctl_deps,
-           include_directories: [configinc],
-           install: true)
+grdctl = executable('grdctl',
+                    ctl_sources,
+                    dependencies: ctl_deps,
+                    include_directories: [configinc],
+                    install: true)
 
 if have_rdp
   executable('gnome-remote-desktop-enable-service',
@@ -432,20 +432,20 @@ if have_rdp
              install_dir: libexecdir)
 endif
 
-custom_target('gsettings-enums',
-              input: 'grd-enums.h',
-              output: 'org.gnome.desktop.remote-desktop.enums.xml',
-              install: true,
-              install_dir: schemadir,
-              capture: true,
-              command: ['glib-mkenums',
-                '--comments', '<!-- @comment@ -->',
-                '--fhead', '<schemalist>',
-                '--vhead', '  <@type@ id="org.gnome.desktop.remote-desktop.@EnumName@">',
-                '--vprod', '    <value nick="@valuenick@" value="@valuenum@"/>',
-                '--vtail', '  </@type@>',
-                '--ftail', '</schemalist>',
-                '@INPUT@'])
+gsettings_enums = custom_target('gsettings-enums',
+                                input: 'grd-enums.h',
+                                output: 'org.gnome.desktop.remote-desktop.enums.xml',
+                                install: true,
+                                install_dir: schemadir,
+                                capture: true,
+                                command: ['glib-mkenums',
+                                  '--comments', '<!-- @comment@ -->',
+                                  '--fhead', '<schemalist>',
+                                  '--vhead', '  <@type@ id="org.gnome.desktop.remote-desktop.@EnumName@">',
+                                  '--vprod', '    <value nick="@valuenick@" value="@valuenum@"/>',
+                                  '--vtail', '  </@type@>',
+                                  '--ftail', '</schemalist>',
+                                  '@INPUT@'])
 schema = 'org.gnome.desktop.remote-desktop.gschema.xml'
 generated_schema = configure_file(output: schema,
                                   input: schema + '.in',

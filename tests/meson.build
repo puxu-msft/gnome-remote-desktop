@@ -15,6 +15,18 @@ add_test_setup('default',
 
 assert(have_rdp or have_vnc)
 
+if have_rdp
+  test('grdctl', sh,
+    args: [
+      files('grdctl-test.sh'),
+      grdctl.full_path(),
+      fs.parent(generated_schema.full_path()),
+    ],
+    depends: [grdctl, gsettings_enums],
+    is_parallel: false,
+  )
+endif
+
 
 pipewire_test_runner = find_program('pipewire-test-runner.sh', required: true)
 pipewire = find_program('pipewire', required: true)
