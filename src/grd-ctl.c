@@ -1184,7 +1184,7 @@ main (int   argc,
     }
 
   pw = getpwnam (GRD_USERNAME);
-  if (geteuid () == pw->pw_uid)
+  if (pw && geteuid () == pw->pw_uid)
     runtime_mode = GRD_RUNTIME_MODE_SYSTEM;
 
   settings = create_settings (runtime_mode);
