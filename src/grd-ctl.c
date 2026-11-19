@@ -131,14 +131,31 @@ is_numeric (const char *s)
   return TRUE;
 }
 
+static GDataInputStream *
+get_stdin_stream (void)
+{
+  static GDataInputStream *data_input_stream = NULL;
+
+  /* The stream buffers what it reads, and a pipe can deliver several
+   * lines in one read, so every prompt has to share one stream. */
+  if (!data_input_stream)
+    {
+      g_autoptr (GInputStream) input_stream = NULL;
+
+      input_stream = g_unix_input_stream_new (STDIN_FILENO, FALSE);
+      data_input_stream = g_data_input_stream_new (input_stream);
+    }
+
+  return data_input_stream;
+}
+
 static char *
 prompt_for_input (const char  *prompt,
                   PromptType   prompt_type,
                   GError     **error)
 {
-  g_autoptr (GInputStream) input_stream = NULL;
   g_autoptr (GOutputStream) output_stream = NULL;
-  g_autoptr (GDataInputStream) data_input_stream = NULL;
+  g_autoptr (GError) local_error = NULL;
   gboolean terminal_attributes_changed = FALSE;
   struct termios terminal_attributes;
   g_autofree char *input = NULL;
@@ -148,9 +165,6 @@ prompt_for_input (const char  *prompt,
 
   input_fd = STDIN_FILENO;
   output_fd = STDOUT_FILENO;
-
-  input_stream = g_unix_input_stream_new (input_fd, FALSE);
-  data_input_stream = g_data_input_stream_new (input_stream);
 
   if (isatty (output_fd))
     output_stream = g_unix_output_stream_new (output_fd, FALSE);
@@ -189,12 +203,26 @@ prompt_for_input (const char  *prompt,
         }
     }
 
-  input = g_data_input_stream_read_line_utf8 (data_input_stream, NULL, NULL, error);
+  input = g_data_input_stream_read_line_utf8 (get_stdin_stream (), NULL, NULL,
+                                              &local_error);
 
   if (terminal_attributes_changed)
     {
       g_output_stream_write_all (output_stream, "\n", strlen ("\n"), NULL, NULL, NULL);
       tcsetattr (input_fd, TCSANOW, &terminal_attributes);
+    }
+
+  if (local_error)
+    {
+      g_propagate_error (error, g_steal_pointer (&local_error));
+      return NULL;
+    }
+
+  if (!input)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "Unexpected end of input");
+      return NULL;
     }
 
   return g_steal_pointer (&input);
