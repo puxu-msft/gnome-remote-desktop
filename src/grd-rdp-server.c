@@ -170,20 +170,6 @@ on_session_stopped (GrdSession   *session,
 }
 
 static void
-maybe_stop_session (gpointer key,
-                    gpointer value,
-                    gpointer user_data)
-{
-  GrdSession *session = GRD_SESSION (value);
-  GrdSession *session_to_ignore = GRD_SESSION (user_data);
-
-  if (session == session_to_ignore)
-    return;
-
-  grd_session_stop (session);
-}
-
-static void
 on_session_post_connect (GrdSessionRdp *session_rdp,
                          GrdRdpServer  *rdp_server)
 {
@@ -207,9 +193,19 @@ on_session_post_connect (GrdSessionRdp *session_rdp,
   if (runtime_mode == GRD_RUNTIME_MODE_HANDOVER ||
       runtime_mode == GRD_RUNTIME_MODE_HEADLESS)
     {
-      g_hash_table_foreach (rdp_server->sessions,
-                            maybe_stop_session,
-                            session_rdp);
+      g_autoptr (GList) sessions = NULL;
+      GList *l;
+
+      /* Stopping a session removes it from the table synchronously
+       * (on_session_stopped()), so iterate over a snapshot. */
+      sessions = g_hash_table_get_values (rdp_server->sessions);
+      for (l = sessions; l; l = l->next)
+        {
+          GrdSession *session = l->data;
+
+          if (session != GRD_SESSION (session_rdp))
+            grd_session_stop (session);
+        }
     }
 }
 
