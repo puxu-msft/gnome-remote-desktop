@@ -364,8 +364,6 @@ grd_session_rdp_send_server_redirection (GrdSessionRdp *session_rdp,
   uint32_t redirection_incorrect_flags = 0;
 
   g_assert (routing_token);
-  g_assert (username);
-  g_assert (password);
   g_assert (certificate);
 
   redirection = redirection_new ();
@@ -377,20 +375,30 @@ grd_session_rdp_send_server_redirection (GrdSessionRdp *session_rdp,
                                (BYTE *) routing_token,
                                strlen (routing_token));
 
-  /* Username */
-  redirection_flags |= LB_USERNAME;
-  redirection_set_string_option (redirection, LB_USERNAME,
-                                 username);
+  /* Username and password are optional: mstsc honors redirected
+   * credentials, but cannot use the PK-encrypted one-time password,
+   * so it must fall back to the original (system) credentials.
+   */
+  if (username && *username)
+    {
+      redirection_flags |= LB_USERNAME;
+      redirection_set_string_option (redirection, LB_USERNAME,
+                                     username);
+    }
 
-  /* Password */
-  redirection_flags |= LB_PASSWORD;
-  if (os_major_type != OSMAJORTYPE_IOS && os_major_type != OSMAJORTYPE_ANDROID)
-    redirection_flags |= LB_PASSWORD_IS_PK_ENCRYPTED;
-  utf16_password = get_utf16_string (password, &size);
-  g_assert (utf16_password);
-  redirection_set_byte_option (redirection, LB_PASSWORD,
-                               (BYTE *) utf16_password,
-                               size);
+  if (password && *password)
+    {
+      /* Password */
+      redirection_flags |= LB_PASSWORD;
+      if (os_major_type != OSMAJORTYPE_IOS &&
+          os_major_type != OSMAJORTYPE_ANDROID)
+        redirection_flags |= LB_PASSWORD_IS_PK_ENCRYPTED;
+      utf16_password = get_utf16_string (password, &size);
+      g_assert (utf16_password);
+      redirection_set_byte_option (redirection, LB_PASSWORD,
+                                   (BYTE *) utf16_password,
+                                   size);
+    }
 
   /* Redirection GUID */
   redirection_flags |= LB_REDIRECTION_GUID;

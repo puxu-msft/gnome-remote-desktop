@@ -388,11 +388,15 @@ on_handle_start_handover (GrdDBusRemoteDesktopRdpHandover *interface,
   /* The remote client is at daemon-system */
   if (remote_client->session)
     {
+      /* mstsc cannot use the PK-encrypted one-time password for the
+       * NLA reconnect; omit the credentials, so it falls back to the
+       * original ones, matching the system credentials SAM.
+       */
       if (!grd_session_rdp_send_server_redirection (
              GRD_SESSION_RDP (remote_client->session),
              routing_token,
-             username,
-             password,
+             remote_client->is_client_mstsc ? NULL : username,
+             remote_client->is_client_mstsc ? NULL : password,
              certificate))
         goto err;
     }
@@ -403,8 +407,8 @@ on_handle_start_handover (GrdDBusRemoteDesktopRdpHandover *interface,
                      remote_client->handover_src->interface));
       redirect_variant = g_variant_new ("(sss)",
                                         routing_token,
-                                        username,
-                                        password);
+                                        remote_client->is_client_mstsc ? "" : username,
+                                        remote_client->is_client_mstsc ? "" : password);
       g_dbus_connection_emit_signal (connection,
                                      remote_client->handover_src->sender_name,
                                      remote_client->handover_src->object_path,
