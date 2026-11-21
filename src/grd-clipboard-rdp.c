@@ -831,6 +831,21 @@ grd_clipboard_rdp_submit_requested_server_content (GrdClipboard *clipboard,
           if (request_context->needs_null_terminator)
             {
               char *pnull_terminator;
+              size_t text_size;
+
+              /*
+               * Stop at the first embedded NUL: WinPR 3.32.2 copies UTF-8
+               * text only up to the first NUL, but keeps using src_size as
+               * its length and reads past that copy.
+               */
+              text_size = strnlen ((char *) src_data, src_size);
+              if (text_size < src_size)
+                {
+                  g_debug ("[RDP.CLIPRDR] Clipboard text contains an embedded "
+                           "NUL, truncating %u bytes to %zu", src_size,
+                           text_size);
+                  src_size = text_size;
+                }
 
               src_data = g_realloc (src_data, src_size + 1);
               pnull_terminator = (char *) src_data + src_size;
