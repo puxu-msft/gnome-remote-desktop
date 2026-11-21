@@ -72,10 +72,8 @@ test_tpm_write (void)
   g_autoptr (GrdTpm) tpm = NULL;
   g_autoptr (GError) error = NULL;
   ESYS_TR primary_handle = 0;
-  g_autofree TPMS_CONTEXT *primary = NULL;
   g_autofree TPML_PCR_SELECTION *pcr_selection = NULL;
   g_autofree TPML_DIGEST *pcr_digest = NULL;
-  g_autofree TPMS_CONTEXT *secret_tpms_context = NULL;
 
   tpm = grd_tpm_new (GRD_TPM_MODE_WRITE, &error);
   if (!tpm)
@@ -103,17 +101,12 @@ test_tpm_write (void)
                              primary_handle,
                              pcr_selection,
                              pcr_digest,
-                             &secret_tpms_context,
+                             &secret_variant,
                              &error))
     g_error ("Failed to store secret: %s", error->message);
 
-  g_assert_nonnull (secret_tpms_context);
-  g_assert_cmpuint (secret_tpms_context->sequence, !=, 0);
-  g_assert_cmpuint (secret_tpms_context->savedHandle, !=, 0);
-  g_assert_cmpuint (secret_tpms_context->hierarchy, !=, 0);
-  g_assert_cmpuint (secret_tpms_context->contextBlob.size, >, 0);
-
-  secret_variant = grd_tpms_context_to_variant (secret_tpms_context);
+  g_assert_nonnull (secret_variant);
+  g_variant_ref_sink (secret_variant);
 }
 
 static void

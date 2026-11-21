@@ -58,10 +58,8 @@ grd_credentials_tpm_store (GrdCredentials      *credentials,
   g_autoptr (GrdTpm) tpm = NULL;
   g_autofree const char *serialized = NULL;
   ESYS_TR primary_handle = 0;
-  g_autofree TPMS_CONTEXT *primary = NULL;
   g_autofree TPML_PCR_SELECTION *pcr_selection = NULL;
   g_autofree TPML_DIGEST *pcr_digest = NULL;
-  g_autofree TPMS_CONTEXT *secret_tpms_context = NULL;
   g_autoptr (GVariant) secret_variant = NULL;
   g_autofree char *secret_serialized = NULL;
   g_autofree char *dir_path = NULL;
@@ -89,11 +87,9 @@ grd_credentials_tpm_store (GrdCredentials      *credentials,
                              primary_handle,
                              pcr_selection,
                              pcr_digest,
-                             &secret_tpms_context,
+                             &secret_variant,
                              error))
     return FALSE;
-
-  secret_variant = grd_tpms_context_to_variant (secret_tpms_context);
 
   dir_path = g_build_path ("/",
                            g_get_user_data_dir (),
@@ -155,8 +151,7 @@ grd_credentials_tpm_lookup (GrdCredentials      *credentials,
       return NULL;
     }
 
-  secret_variant = g_variant_parse (G_VARIANT_TYPE ("(uutqs)"), serialized,
-                                    NULL, NULL, error);
+  secret_variant = g_variant_parse (NULL, serialized, NULL, NULL, error);
   if (!secret_variant)
     return NULL;
 
@@ -196,7 +191,7 @@ grd_credentials_tpm_clear (GrdCredentials      *credentials,
                               NULL);
   secret_file = g_file_new_for_path (secret_path);
 
-  if (!g_file_delete (secret_file, NULL, error))
+  if (!g_file_delete (secret_file, NULL, &local_error))
     {
       if (g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
         {

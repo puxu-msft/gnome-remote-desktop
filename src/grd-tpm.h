@@ -51,10 +51,8 @@ gboolean grd_tpm_store_secret (GrdTpm              *tpm,
                                ESYS_TR              primary_handle,
                                TPML_PCR_SELECTION  *pcr_selection,
                                TPML_DIGEST         *pcr_digest,
-                               TPMS_CONTEXT       **secret_tpms_context_out,
+                               GVariant           **secret_variant_out,
                                GError             **error);
-
-GVariant * grd_tpms_context_to_variant (TPMS_CONTEXT *tpms_context);
 
 char * grd_tpm_restore_secret (GrdTpm              *tpm,
                                GVariant            *secret_variant,

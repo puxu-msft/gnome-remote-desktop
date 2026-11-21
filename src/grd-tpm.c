@@ -34,6 +34,26 @@ G_GNUC_END_IGNORE_DEPRECATIONS
 
 #include "grd-debug.h"
 
+/*
+ * Sealed secrets are persisted as the sealed object's public and private
+ * areas (wire-format TPM2B_PUBLIC / TPM2B_PRIVATE, base64), see
+ * SEALED_OBJECT_VARIANT_TYPE. Restoring re-derives the primary key from the
+ * owner hierarchy seed and loads the object under it; both survive a TPM
+ * Reset, so the secret stays readable across reboots.
+ *
+ * The primary key is ECC NIST P-256: deriving it happens on every restore,
+ * and RSA-2048 derivation takes ~18 s on some TPMs (e.g. STM ST33 in
+ * ThinkPad P14s) versus ~0.4 s for ECC.
+ *
+ * Secrets written by older versions are a TPMS_CONTEXT of the loaded object
+ * (LEGACY_CONTEXT_VARIANT_TYPE). Saved contexts are bound to the TPM Reset
+ * count, so they only restore within the boot they were written in; they are
+ * still read for compatibility until re-stored.
+ */
+#define SEALED_OBJECT_VARIANT_TYPE "(uss)"
+#define SEALED_OBJECT_FORMAT_VERSION 1
+#define LEGACY_CONTEXT_VARIANT_TYPE "(uutqs)"
+
 struct _GrdTpm
 {
   GObject parent;
@@ -205,7 +225,7 @@ grd_tpm_create_primary (GrdTpm   *tpm,
   TPM2B_SENSITIVE_CREATE in_sensitive_primary = {};
   TPM2B_PUBLIC in_public = {
     .publicArea = {
-      .type = TPM2_ALG_RSA,
+      .type = TPM2_ALG_ECC,
       .nameAlg = TPM2_ALG_SHA256,
       .objectAttributes = (TPMA_OBJECT_RESTRICTED |
                            TPMA_OBJECT_DECRYPT |
@@ -213,6 +233,16 @@ grd_tpm_create_primary (GrdTpm   *tpm,
                            TPMA_OBJECT_FIXEDPARENT |
                            TPMA_OBJECT_SENSITIVEDATAORIGIN |
                            TPMA_OBJECT_USERWITHAUTH),
+      .parameters.eccDetail = {
+        .symmetric = {
+          .algorithm = TPM2_ALG_AES,
+          .keyBits.aes = 128,
+          .mode.aes = TPM2_ALG_CFB,
+        },
+        .scheme.scheme = TPM2_ALG_NULL,
+        .curveID = TPM2_ECC_NIST_P256,
+        .kdf.scheme = TPM2_ALG_NULL,
+      },
     },
   };
   TPM2B_DATA outside_info = {};
@@ -220,12 +250,6 @@ grd_tpm_create_primary (GrdTpm   *tpm,
   TSS2_RC rc;
 
   g_assert (tpm->hmac_session);
-
-  in_public.publicArea.parameters.rsaDetail.keyBits = 2048;
-  in_public.publicArea.parameters.asymDetail.scheme.scheme = TPM2_ALG_NULL;
-  in_public.publicArea.parameters.symDetail.sym.algorithm = TPM2_ALG_AES;
-  in_public.publicArea.parameters.symDetail.sym.keyBits.sym = 128;
-  in_public.publicArea.parameters.symDetail.sym.mode.sym = TPM2_ALG_CFB;
 
   rc = Esys_CreatePrimary (tpm->esys_context,
                            ESYS_TR_RH_OWNER,
@@ -344,13 +368,54 @@ do_create_policy (GrdTpm              *tpm,
   return TRUE;
 }
 
+static char *
+marshal_public_base64 (TPM2B_PUBLIC  *public,
+                       GError       **error)
+{
+  uint8_t buffer[sizeof (TPM2B_PUBLIC)];
+  size_t offset = 0;
+  TSS2_RC rc;
+
+  rc = Tss2_MU_TPM2B_PUBLIC_Marshal (public, buffer, sizeof (buffer), &offset);
+  if (rc != TSS2_RC_SUCCESS)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "Failed to marshal sealed object public area: %s",
+                   Tss2_RC_Decode (rc));
+      return NULL;
+    }
+
+  return g_base64_encode (buffer, offset);
+}
+
+static char *
+marshal_private_base64 (TPM2B_PRIVATE  *private,
+                        GError        **error)
+{
+  uint8_t buffer[sizeof (TPM2B_PRIVATE)];
+  size_t offset = 0;
+  TSS2_RC rc;
+
+  rc = Tss2_MU_TPM2B_PRIVATE_Marshal (private, buffer, sizeof (buffer),
+                                      &offset);
+  if (rc != TSS2_RC_SUCCESS)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "Failed to marshal sealed object private area: %s",
+                   Tss2_RC_Decode (rc));
+      return NULL;
+    }
+
+  return g_base64_encode (buffer, offset);
+}
+
 gboolean
 grd_tpm_store_secret (GrdTpm              *tpm,
                       const char          *secret,
                       ESYS_TR              primary_handle,
                       TPML_PCR_SELECTION  *pcr_selection,
                       TPML_DIGEST         *pcr_digest,
-                      TPMS_CONTEXT       **secret_tpms_context_out,
+                      GVariant           **secret_variant_out,
                       GError             **error)
 {
   size_t secret_size;
@@ -360,6 +425,10 @@ grd_tpm_store_secret (GrdTpm              *tpm,
   TPM2B_PUBLIC template_public;
   TPM2B_SENSITIVE_CREATE in_sensitive;
   ESYS_TR secret_handle;
+  g_autofree TPM2B_PRIVATE *out_private = NULL;
+  g_autofree TPM2B_PUBLIC *out_public = NULL;
+  g_autofree char *public_base64 = NULL;
+  g_autofree char *private_base64 = NULL;
   TSS2_RC rc;
 
   g_assert (tpm->trial_session);
@@ -420,7 +489,8 @@ grd_tpm_store_secret (GrdTpm              *tpm,
                           &in_sensitive,
                           &template,
                           &secret_handle,
-                          NULL, NULL);
+                          &out_private,
+                          &out_public);
   if (rc != TSS2_RC_SUCCESS)
     {
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
@@ -429,13 +499,105 @@ grd_tpm_store_secret (GrdTpm              *tpm,
       return FALSE;
     }
 
-  rc = Esys_ContextSave (tpm->esys_context,
-                         secret_handle,
-                         secret_tpms_context_out);
+  Esys_FlushContext (tpm->esys_context, secret_handle);
+
+  public_base64 = marshal_public_base64 (out_public, error);
+  if (!public_base64)
+    return FALSE;
+
+  private_base64 = marshal_private_base64 (out_private, error);
+  if (!private_base64)
+    return FALSE;
+
+  *secret_variant_out = g_variant_new (SEALED_OBJECT_VARIANT_TYPE,
+                                       SEALED_OBJECT_FORMAT_VERSION,
+                                       public_base64,
+                                       private_base64);
+
+  return TRUE;
+}
+
+static gboolean
+decode_sealed_object_variant (GVariant       *variant,
+                              TPM2B_PUBLIC   *public_out,
+                              TPM2B_PRIVATE  *private_out,
+                              GError        **error)
+{
+  uint32_t version;
+  const char *public_base64;
+  const char *private_base64;
+  g_autofree uint8_t *public_buffer = NULL;
+  g_autofree uint8_t *private_buffer = NULL;
+  size_t public_size;
+  size_t private_size;
+  size_t offset;
+  TSS2_RC rc;
+
+  g_variant_get (variant, "(u&s&s)",
+                 &version, &public_base64, &private_base64);
+  if (version != SEALED_OBJECT_FORMAT_VERSION)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                   "Unsupported sealed TPM object format version %u",
+                   version);
+      return FALSE;
+    }
+
+  public_buffer = g_base64_decode (public_base64, &public_size);
+  offset = 0;
+  rc = Tss2_MU_TPM2B_PUBLIC_Unmarshal (public_buffer, public_size,
+                                       &offset, public_out);
+  if (rc != TSS2_RC_SUCCESS || offset != public_size)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "Failed to decode sealed TPM object public area");
+      return FALSE;
+    }
+
+  private_buffer = g_base64_decode (private_base64, &private_size);
+  offset = 0;
+  rc = Tss2_MU_TPM2B_PRIVATE_Unmarshal (private_buffer, private_size,
+                                        &offset, private_out);
+  if (rc != TSS2_RC_SUCCESS || offset != private_size)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "Failed to decode sealed TPM object private area");
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+static gboolean
+load_sealed_object (GrdTpm    *tpm,
+                    GVariant  *variant,
+                    ESYS_TR   *loaded_secret_handle_out,
+                    GError   **error)
+{
+  TPM2B_PUBLIC in_public = {};
+  TPM2B_PRIVATE in_private = {};
+  ESYS_TR primary_handle = ESYS_TR_NONE;
+  TSS2_RC rc;
+
+  if (!decode_sealed_object_variant (variant, &in_public, &in_private, error))
+    return FALSE;
+
+  if (!grd_tpm_create_primary (tpm, &primary_handle, error))
+    return FALSE;
+
+  rc = Esys_Load (tpm->esys_context,
+                  primary_handle,
+                  tpm->hmac_session,
+                  ESYS_TR_NONE,
+                  ESYS_TR_NONE,
+                  &in_private,
+                  &in_public,
+                  loaded_secret_handle_out);
+  Esys_FlushContext (tpm->esys_context, primary_handle);
   if (rc != TSS2_RC_SUCCESS)
     {
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Esys_ContextSave failed: %s",
+                   "Esys_Load failed: %s",
                    Tss2_RC_Decode (rc));
       return FALSE;
     }
@@ -443,41 +605,16 @@ grd_tpm_store_secret (GrdTpm              *tpm,
   return TRUE;
 }
 
-GVariant *
-grd_tpms_context_to_variant (TPMS_CONTEXT *tpms_context)
-{
-  g_autofree char *base64 = NULL;
-  GVariant *variant;
-
-  base64 = g_base64_encode (tpms_context->contextBlob.buffer,
-                            tpms_context->contextBlob.size);
-
-  variant = g_variant_new ("(uutqs)",
-                           tpms_context->hierarchy,
-                           tpms_context->savedHandle,
-                           tpms_context->sequence,
-                           tpms_context->contextBlob.size,
-                           base64);
-
-  return variant;
-}
-
 static gboolean
-decode_variant (GVariant      *variant,
-                TPMS_CONTEXT  *tpms_context,
-                GError       **error)
+decode_legacy_context_variant (GVariant      *variant,
+                               TPMS_CONTEXT  *tpms_context,
+                               GError       **error)
 {
   g_autofree char *base64 = NULL;
   g_autofree uint8_t *decoded = NULL;
   size_t size;
 
-  if (!g_variant_is_of_type (variant, G_VARIANT_TYPE ("(uutqs)")))
-    {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Invalid tpms context variant type");
-      return FALSE;
-    }
-  g_variant_get (variant, "(uutqs)",
+  g_variant_get (variant, LEGACY_CONTEXT_VARIANT_TYPE,
                  &tpms_context->hierarchy,
                  &tpms_context->savedHandle,
                  &tpms_context->sequence,
@@ -505,22 +642,41 @@ grd_tpm_restore_secret (GrdTpm              *tpm,
                         GError             **error)
 {
   TSS2_RC rc;
-  TPMS_CONTEXT secret_tpms_context;
-  ESYS_TR loaded_secret_handle;
-  TPM2B_SENSITIVE_DATA *unsealed_data;
+  ESYS_TR loaded_secret_handle = ESYS_TR_NONE;
+  g_autofree TPM2B_SENSITIVE_DATA *unsealed_data = NULL;
 
   g_assert (tpm->policy_session);
 
-  if (!decode_variant (variant, &secret_tpms_context, error))
-    return NULL;
+  if (g_variant_is_of_type (variant,
+                            G_VARIANT_TYPE (SEALED_OBJECT_VARIANT_TYPE)))
+    {
+      if (!load_sealed_object (tpm, variant, &loaded_secret_handle, error))
+        return NULL;
+    }
+  else if (g_variant_is_of_type (variant,
+                                 G_VARIANT_TYPE (LEGACY_CONTEXT_VARIANT_TYPE)))
+    {
+      TPMS_CONTEXT secret_tpms_context;
 
-  rc = Esys_ContextLoad (tpm->esys_context, &secret_tpms_context,
-                         &loaded_secret_handle);
-  if (rc != TSS2_RC_SUCCESS)
+      if (!decode_legacy_context_variant (variant, &secret_tpms_context, error))
+        return NULL;
+
+      rc = Esys_ContextLoad (tpm->esys_context, &secret_tpms_context,
+                             &loaded_secret_handle);
+      if (rc != TSS2_RC_SUCCESS)
+        {
+          g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                       "Esys_ContextLoad failed: %s "
+                       "(legacy saved-context secret, re-store it)",
+                       Tss2_RC_Decode (rc));
+          return NULL;
+        }
+    }
+  else
     {
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Esys_ContextLoad failed: %s",
-                   Tss2_RC_Decode (rc));
+                   "Invalid sealed secret variant type %s",
+                   g_variant_get_type_string (variant));
       return NULL;
     }
 
@@ -529,7 +685,10 @@ grd_tpm_restore_secret (GrdTpm              *tpm,
                          pcr_digest,
                          NULL,
                          error))
-    return NULL;
+    {
+      Esys_FlushContext (tpm->esys_context, loaded_secret_handle);
+      return NULL;
+    }
 
   rc = Esys_Unseal (tpm->esys_context,
                     loaded_secret_handle,
@@ -537,6 +696,7 @@ grd_tpm_restore_secret (GrdTpm              *tpm,
                     ESYS_TR_NONE,
                     ESYS_TR_NONE,
                     &unsealed_data);
+  Esys_FlushContext (tpm->esys_context, loaded_secret_handle);
   if (rc != TSS2_RC_SUCCESS)
     {
       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
@@ -565,6 +725,8 @@ get_algorithm_name (uint32_t algorithm)
       return "SHA-256";
     case TPM2_ALG_RSA:
       return "RSA";
+    case TPM2_ALG_ECC:
+      return "ECC";
     default:
       return "unknown";
     }
@@ -593,6 +755,8 @@ get_command_name (uint32_t command)
       return "ContextSave";
     case TPM2_CC_ContextLoad:
       return "ContextLoad";
+    case TPM2_CC_Load:
+      return "Load";
     case TPM2_CC_Unseal:
       return "Unseal";
     default:
@@ -611,7 +775,7 @@ grd_tpm_check_capabilities (GrdTpm  *tpm,
     int count;
   } capabilities[] = {
     { .capability = TPM2_CAP_ALGS, .property = TPM2_ALG_SHA256 },
-    { .capability = TPM2_CAP_ALGS, .property = TPM2_ALG_RSA },
+    { .capability = TPM2_CAP_ALGS, .property = TPM2_ALG_ECC },
     { .capability = TPM2_CAP_COMMANDS, .property = TPM2_CC_CreatePrimary },
     { .capability = TPM2_CAP_COMMANDS, .property = TPM2_CC_StartAuthSession },
     { .capability = TPM2_CAP_COMMANDS, .property = TPM2_CC_FlushContext },
@@ -619,8 +783,8 @@ grd_tpm_check_capabilities (GrdTpm  *tpm,
     { .capability = TPM2_CAP_COMMANDS, .property = TPM2_CC_PolicyPCR },
     { .capability = TPM2_CAP_COMMANDS, .property = TPM2_CC_PolicyGetDigest },
     { .capability = TPM2_CAP_COMMANDS, .property = TPM2_CC_CreateLoaded },
-    { .capability = TPM2_CAP_COMMANDS, .property = TPM2_CC_ContextSave },
     { .capability = TPM2_CAP_COMMANDS, .property = TPM2_CC_ContextLoad },
+    { .capability = TPM2_CAP_COMMANDS, .property = TPM2_CC_Load },
   };
   gboolean sha256_pcrs_found = FALSE;
   uint32_t property = 0;
