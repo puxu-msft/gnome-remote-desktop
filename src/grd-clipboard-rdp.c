@@ -65,6 +65,8 @@ typedef struct _ClientFormatDataRequestContext
 
   gboolean has_clip_data_id;
   uint32_t clip_data_id;
+
+  gboolean is_echo_probe;
 } ClientFormatDataRequestContext;
 
 typedef struct _ClipDataEntry
@@ -126,6 +128,18 @@ struct _GrdClipboardRdp
   GrdMimeType which_unicode_format;
   ServerFormatDataRequestContext *format_data_request_context;
 
+  /*
+   * Some client-side applications read the clipboard and put the text back,
+   * which makes the client announce a text-only FormatList right after ours.
+   * served_unicode_text_* identify the CF_UNICODETEXT (up to its NUL) last sent
+   * to the client for the current local clipboard, by size and SHA-256 rather
+   * than a copy; a text-only client FormatList is held in
+   * echo_probe_mime_type_tables until its text has been compared.
+   */
+  char *served_unicode_text_sha256;
+  uint32_t served_unicode_text_size;
+  GList *echo_probe_mime_type_tables;
+
   GHashTable *pending_client_requests;
   GQueue *ordered_client_requests;
 
@@ -161,10 +175,53 @@ G_DEFINE_TYPE (GrdClipboardRdp, grd_clipboard_rdp, GRD_TYPE_CLIPBOARD)
 
 static gboolean
 send_mime_type_content_request (GrdClipboardRdp  *clipboard_rdp,
-                                GrdMimeTypeTable *mime_type_table);
+                                GrdMimeTypeTable *mime_type_table,
+                                gboolean          is_echo_probe);
 
 static void
 create_new_winpr_clipboard (GrdClipboardRdp *clipboard_rdp);
+
+static void
+finish_echo_probe (GrdClipboardRdp *clipboard_rdp,
+                   const uint8_t   *data,
+                   uint32_t         size);
+
+/* Size in bytes of UTF-16 text up to (excluding) its first NUL */
+static uint32_t
+get_utf16_text_size (const uint8_t *data,
+                     uint32_t       size)
+{
+  uint32_t i;
+
+  for (i = 0; i + 1 < size; i += 2)
+    {
+      if (!data[i] && !data[i + 1])
+        return i;
+    }
+
+  return size & ~1u;
+}
+
+static char *
+compute_utf16_text_sha256 (const uint8_t *data,
+                           uint32_t       text_size)
+{
+  return g_compute_checksum_for_data (G_CHECKSUM_SHA256, data, text_size);
+}
+
+static void
+forget_served_unicode_text (GrdClipboardRdp *clipboard_rdp)
+{
+  g_clear_pointer (&clipboard_rdp->served_unicode_text_sha256, g_free);
+  clipboard_rdp->served_unicode_text_size = 0;
+}
+
+static void
+cancel_echo_probe (GrdClipboardRdp *clipboard_rdp)
+{
+  g_list_free_full (g_steal_pointer (&clipboard_rdp->echo_probe_mime_type_tables),
+                    g_free);
+}
 
 static void
 update_allowed_server_formats (GrdClipboardRdp *clipboard_rdp,
@@ -412,6 +469,13 @@ grd_clipboard_rdp_update_client_mime_type_list (GrdClipboard *clipboard,
 {
   GrdClipboardRdp *clipboard_rdp = GRD_CLIPBOARD_RDP (clipboard);
 
+  /*
+   * New local content: nothing served for the old one can be echoed any more,
+   * and a client FormatList still waiting for its echo probe is outdated.
+   */
+  forget_served_unicode_text (clipboard_rdp);
+  cancel_echo_probe (clipboard_rdp);
+
   remove_duplicated_clipboard_mime_types (clipboard_rdp, &mime_type_list);
   if (!mime_type_list)
     return;
@@ -623,7 +687,7 @@ maybe_send_next_mime_type_content_request (GrdClipboardRdp *clipboard_rdp)
       return;
     }
 
-  if (!send_mime_type_content_request (clipboard_rdp, mime_type_table))
+  if (!send_mime_type_content_request (clipboard_rdp, mime_type_table, FALSE))
     {
       abort_client_requests_for_mime_type (clipboard_rdp, mime_type);
       g_free (mime_type_table);
@@ -640,6 +704,7 @@ abort_current_client_request (gpointer user_data)
 {
   GrdClipboardRdp *clipboard_rdp = user_data;
   ClientFormatDataRequestContext *request_context;
+  gboolean was_echo_probe;
 
   g_mutex_lock (&clipboard_rdp->client_request_mutex);
   request_context = g_steal_pointer (&clipboard_rdp->current_client_request);
@@ -650,10 +715,14 @@ abort_current_client_request (gpointer user_data)
 
   g_warning ("[RDP.CLIPRDR] Possible protocol violation: Client did not send "
              "format data response (Timeout reached)");
+  was_echo_probe = request_context->is_echo_probe;
   abort_client_requests_for_context (clipboard_rdp, request_context);
   g_free (request_context);
 
   clipboard_rdp->client_request_abort_id = 0;
+  /* Undecided echo probe: fall back to taking the client FormatList */
+  if (was_echo_probe)
+    finish_echo_probe (clipboard_rdp, NULL, 0);
   maybe_send_next_mime_type_content_request (clipboard_rdp);
 
   return G_SOURCE_REMOVE;
@@ -661,7 +730,8 @@ abort_current_client_request (gpointer user_data)
 
 static gboolean
 send_mime_type_content_request (GrdClipboardRdp  *clipboard_rdp,
-                                GrdMimeTypeTable *mime_type_table)
+                                GrdMimeTypeTable *mime_type_table,
+                                gboolean          is_echo_probe)
 {
   GrdRdpFuseClipboard *rdp_fuse_clipboard = clipboard_rdp->rdp_fuse_clipboard;
   CliprdrServerContext *cliprdr_context = clipboard_rdp->cliprdr_context;
@@ -677,6 +747,7 @@ send_mime_type_content_request (GrdClipboardRdp  *clipboard_rdp,
 
   request_context = g_malloc0 (sizeof (ClientFormatDataRequestContext));
   request_context->mime_type_table = *mime_type_table;
+  request_context->is_echo_probe = is_echo_probe;
 
   if (clipboard_rdp->cliprdr_context->canLockClipData &&
       (mime_type == GRD_MIME_TYPE_TEXT_URILIST ||
@@ -761,7 +832,7 @@ grd_clipboard_rdp_request_client_content_for_mime_type (GrdClipboard     *clipbo
     }
 
   g_assert (g_queue_is_empty (clipboard_rdp->ordered_client_requests));
-  if (!send_mime_type_content_request (clipboard_rdp, mime_type_table))
+  if (!send_mime_type_content_request (clipboard_rdp, mime_type_table, FALSE))
     {
       grd_clipboard_submit_client_content_for_mime_type (clipboard, serial,
                                                          NULL, 0);
@@ -915,6 +986,16 @@ grd_clipboard_rdp_submit_requested_server_content (GrdClipboard *clipboard,
         }
     }
 
+  if (dst_data && dst_format_id == CF_UNICODETEXT)
+    {
+      forget_served_unicode_text (clipboard_rdp);
+      clipboard_rdp->served_unicode_text_size =
+        get_utf16_text_size (dst_data, dst_size);
+      clipboard_rdp->served_unicode_text_sha256 =
+        compute_utf16_text_sha256 (dst_data,
+                                   clipboard_rdp->served_unicode_text_size);
+    }
+
   format_data_response.common.msgType = CB_FORMAT_DATA_RESPONSE;
   format_data_response.common.msgFlags = dst_data ? CB_RESPONSE_OK
                                                   : CB_RESPONSE_FAIL;
@@ -991,6 +1072,8 @@ abort_all_client_requests (GrdClipboardRdp *clipboard_rdp)
 
   g_debug ("[RDP.CLIPRDR] Aborting all pending client requests");
 
+  cancel_echo_probe (clipboard_rdp);
+
   g_mutex_lock (&clipboard_rdp->client_request_mutex);
   request_context = g_steal_pointer (&clipboard_rdp->current_client_request);
 
@@ -1014,20 +1097,18 @@ abort_all_client_requests (GrdClipboardRdp *clipboard_rdp)
   g_queue_clear_full (clipboard_rdp->ordered_client_requests, g_free);
 }
 
-static gboolean
-update_server_format_list (gpointer user_data)
+/* Make the client FormatList the content of the local clipboard */
+static void
+take_over_server_clipboard (GrdClipboardRdp *clipboard_rdp,
+                            GList           *mime_type_tables)
 {
-  ServerFormatListUpdateContext *update_context = user_data;
-  GrdClipboardRdp *clipboard_rdp = update_context->clipboard_rdp;
-  GrdClipboard *clipboard = GRD_CLIPBOARD (update_context->clipboard_rdp);
+  GrdClipboard *clipboard = GRD_CLIPBOARD (clipboard_rdp);
   GrdRdpFuseClipboard *rdp_fuse_clipboard = clipboard_rdp->rdp_fuse_clipboard;
-  CliprdrServerContext *cliprdr_context = clipboard_rdp->cliprdr_context;
-  CLIPRDR_FORMAT_LIST_RESPONSE format_list_response = {0};
-  GList *mime_type_tables;
   GrdMimeTypeTable *mime_type_table;
   GList *l;
 
-  mime_type_tables = g_steal_pointer (&update_context->mime_type_tables);
+  forget_served_unicode_text (clipboard_rdp);
+
   for (l = mime_type_tables; l; l = l->next)
     {
       mime_type_table = l->data;
@@ -1049,12 +1130,119 @@ update_server_format_list (gpointer user_data)
 
   abort_all_client_requests (clipboard_rdp);
   grd_clipboard_update_server_mime_type_list (clipboard, mime_type_tables);
+}
+
+/*
+ * A client FormatList may only echo the local text: it carries nothing but
+ * CF_UNICODETEXT, we served CF_UNICODETEXT for the current local content, and
+ * no paste request is using the client request slot.
+ */
+static gboolean
+is_echo_candidate (GrdClipboardRdp *clipboard_rdp,
+                   GList           *mime_type_tables)
+{
+  GrdMimeTypeTable *mime_type_table;
+  GList *l;
+
+  if (!clipboard_rdp->served_unicode_text_sha256 || !mime_type_tables)
+    return FALSE;
+
+  if (clipboard_rdp->current_client_request ||
+      !g_queue_is_empty (clipboard_rdp->ordered_client_requests))
+    return FALSE;
+
+  for (l = mime_type_tables; l; l = l->next)
+    {
+      mime_type_table = l->data;
+
+      if (mime_type_table->mime_type != GRD_MIME_TYPE_TEXT_PLAIN_UTF8 &&
+          mime_type_table->mime_type != GRD_MIME_TYPE_TEXT_UTF8_STRING)
+        return FALSE;
+      if (mime_type_table->rdp.format_id != CF_UNICODETEXT)
+        return FALSE;
+    }
+
+  return TRUE;
+}
+
+static void
+start_echo_probe (GrdClipboardRdp *clipboard_rdp,
+                  GList           *mime_type_tables)
+{
+  GrdMimeTypeTable probe_table = {0};
+
+  probe_table.mime_type = GRD_MIME_TYPE_TEXT_PLAIN_UTF8;
+  probe_table.rdp.format_id = CF_UNICODETEXT;
+
+  g_assert (!clipboard_rdp->echo_probe_mime_type_tables);
+  clipboard_rdp->echo_probe_mime_type_tables = mime_type_tables;
+
+  if (!send_mime_type_content_request (clipboard_rdp, &probe_table, TRUE))
+    finish_echo_probe (clipboard_rdp, NULL, 0);
+}
+
+/* data is NULL when the probe failed; that takes the client FormatList as usual */
+static void
+finish_echo_probe (GrdClipboardRdp *clipboard_rdp,
+                   const uint8_t   *data,
+                   uint32_t         size)
+{
+  GList *mime_type_tables;
+  g_autofree char *sha256 = NULL;
+  uint32_t text_size;
+
+  mime_type_tables = g_steal_pointer (&clipboard_rdp->echo_probe_mime_type_tables);
+  if (!mime_type_tables)
+    return;
+
+  if (data && clipboard_rdp->served_unicode_text_sha256)
+    {
+      text_size = get_utf16_text_size (data, size);
+      if (text_size == clipboard_rdp->served_unicode_text_size)
+        sha256 = compute_utf16_text_sha256 (data, text_size);
+    }
+
+  if (sha256 &&
+      g_str_equal (sha256, clipboard_rdp->served_unicode_text_sha256))
+    {
+      g_debug ("[RDP.CLIPRDR] Client FormatList only echoes the text served to "
+               "it, keeping the local clipboard");
+      g_list_free_full (mime_type_tables, g_free);
+      return;
+    }
+
+  take_over_server_clipboard (clipboard_rdp, mime_type_tables);
+}
+
+static gboolean
+update_server_format_list (gpointer user_data)
+{
+  ServerFormatListUpdateContext *update_context = user_data;
+  GrdClipboardRdp *clipboard_rdp = update_context->clipboard_rdp;
+  GrdRdpFuseClipboard *rdp_fuse_clipboard = clipboard_rdp->rdp_fuse_clipboard;
+  CliprdrServerContext *cliprdr_context = clipboard_rdp->cliprdr_context;
+  CLIPRDR_FORMAT_LIST_RESPONSE format_list_response = {0};
+  GList *mime_type_tables;
+  gboolean probe_echo;
+
+  mime_type_tables = g_steal_pointer (&update_context->mime_type_tables);
+
+  /* A newer client FormatList supersedes one still waiting for its probe */
+  cancel_echo_probe (clipboard_rdp);
+
+  probe_echo = is_echo_candidate (clipboard_rdp, mime_type_tables);
+  if (!probe_echo)
+    take_over_server_clipboard (clipboard_rdp, mime_type_tables);
 
   format_list_response.common.msgType = CB_FORMAT_LIST_RESPONSE;
   format_list_response.common.msgFlags = CB_RESPONSE_OK;
 
   cliprdr_context->ServerFormatListResponse (cliprdr_context,
                                              &format_list_response);
+
+  /* The data request may only follow the FormatListResponse */
+  if (probe_echo)
+    start_echo_probe (clipboard_rdp, mime_type_tables);
 
   /**
    * Any FileContentsRequest that is still waiting for a FileContentsResponse
@@ -2153,12 +2341,20 @@ handle_format_data_response (gpointer user_data)
   mime_type_table = &request_context->mime_type_table;
   mime_type = mime_type_table->mime_type;
 
-  if (extract_format_data_response (clipboard_rdp, format_data_response,
-                                    &src_data, &src_size) &&
-      prepare_client_content_for_server (clipboard_rdp, &src_data, src_size,
-                                         mime_type_table,
-                                         request_context->has_clip_data_id,
-                                         request_context->clip_data_id))
+  if (request_context->is_echo_probe)
+    {
+      if (extract_format_data_response (clipboard_rdp, format_data_response,
+                                        &src_data, &src_size))
+        finish_echo_probe (clipboard_rdp, src_data, src_size);
+      else
+        finish_echo_probe (clipboard_rdp, NULL, 0);
+    }
+  else if (extract_format_data_response (clipboard_rdp, format_data_response,
+                                         &src_data, &src_size) &&
+           prepare_client_content_for_server (clipboard_rdp, &src_data, src_size,
+                                              mime_type_table,
+                                              request_context->has_clip_data_id,
+                                              request_context->clip_data_id))
     {
       serve_mime_type_content (clipboard_rdp, mime_type);
 
@@ -2570,6 +2766,8 @@ grd_clipboard_rdp_dispose (GObject *object)
   g_clear_pointer (&clipboard_rdp->format_data_request_context, g_free);
   g_clear_pointer (&clipboard_rdp->queued_server_formats, g_list_free);
   g_clear_pointer (&clipboard_rdp->pending_server_formats, g_list_free);
+  forget_served_unicode_text (clipboard_rdp);
+  cancel_echo_probe (clipboard_rdp);
 
   if (clipboard_rdp->ordered_client_requests)
     {
