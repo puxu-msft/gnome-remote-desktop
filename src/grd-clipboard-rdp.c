@@ -1620,8 +1620,7 @@ cliprdr_client_format_data_request (CliprdrServerContext              *cliprdr_c
       mime_type = GRD_MIME_TYPE_TEXT_PLAIN;
       needs_null_terminator = TRUE;
       needs_conversion = TRUE;
-      src_format_id = ClipboardGetFormatId (clipboard_rdp->system,
-                                            "text/plain");
+      src_format_id = get_utf8_text_format_id (clipboard_rdp);
       break;
     case CF_UNICODETEXT:
       mime_type = clipboard_rdp->which_unicode_format;
