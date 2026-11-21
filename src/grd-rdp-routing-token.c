@@ -27,7 +27,7 @@
 #include <freerdp/freerdp.h>
 #include <sys/socket.h>
 
-#define MAX_PEEK_TIME_MS 2000
+#define MAX_PEEK_TIME_MS 10000
 #define PROTOCOL_RDSTLS 0x00000004
 
 typedef struct _RoutingTokenContext
