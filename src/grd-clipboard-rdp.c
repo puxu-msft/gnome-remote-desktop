@@ -258,6 +258,20 @@ remove_duplicated_clipboard_mime_types (GrdClipboardRdp  *clipboard_rdp,
       *mime_type_list = g_list_remove (*mime_type_list, GUINT_TO_POINTER (mime_type));
       remove_clipboard_format_data_for_mime_type (clipboard_rdp, mime_type);
     }
+
+  /**
+   * With UTF-8 text available, leave CF_TEXT to the client: Windows
+   * synthesizes it from CF_UNICODETEXT in the client's ANSI code page,
+   * whereas WinPR can only produce UTF-escaped ASCII for it.
+   */
+  mime_type = GRD_MIME_TYPE_TEXT_PLAIN;
+  if (g_list_find (*mime_type_list, GUINT_TO_POINTER (mime_type)) &&
+      (g_list_find (*mime_type_list, GUINT_TO_POINTER (GRD_MIME_TYPE_TEXT_PLAIN_UTF8)) ||
+       g_list_find (*mime_type_list, GUINT_TO_POINTER (GRD_MIME_TYPE_TEXT_UTF8_STRING))))
+    {
+      *mime_type_list = g_list_remove (*mime_type_list, GUINT_TO_POINTER (mime_type));
+      remove_clipboard_format_data_for_mime_type (clipboard_rdp, mime_type);
+    }
 }
 
 static void
