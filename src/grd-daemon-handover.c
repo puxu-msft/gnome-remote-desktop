@@ -51,10 +51,6 @@ struct _GrdDaemonHandover
   GrdSession *session;
 
   gboolean use_system_credentials;
-  GrdPrompt *prompt;
-  GCancellable *prompt_cancellable;
-
-  GrdShellDialog *dialog;
 
   unsigned int gnome_remote_desktop_watch_name_id;
 };
@@ -311,115 +307,16 @@ on_session_stopped (GrdSession        *session,
   daemon_handover->session = NULL;
 }
 
-static gboolean
-show_insecure_connection_dialog (GrdDaemonHandover *daemon_handover)
-{
-  GCancellable *cancellable =
-    grd_daemon_get_cancellable (GRD_DAEMON (daemon_handover));
-
-  g_assert (!daemon_handover->dialog);
-
-  daemon_handover->dialog = grd_shell_dialog_new (cancellable);
-  if (!daemon_handover->dialog)
-    return FALSE;
-
-  g_signal_connect_swapped (daemon_handover->dialog, "cancelled",
-                            G_CALLBACK (grd_session_stop),
-                            daemon_handover->session);
-
-  grd_shell_dialog_open (daemon_handover->dialog,
-                         _("Continue With Insecure Connection?"),
-                         /* Translators: Don't translate “use redirection server name:i:1”.
-                          * It's a menu option, and it's the same for all languages. */
-                         _("This Remote Desktop connection is insecure. "
-                           "To secure this connection, enable RDSTLS Security "
-                           "in your client by saving the connection settings "
-                           "in your client as an RDP file and set "
-                           "“use redirection server name:i:1” in it."),
-                         _("Disconnect"),
-                         _("Continue"));
-
-  return TRUE;
-}
-
-static void
-prompt_response_callback (GObject      *source_object,
-                          GAsyncResult *async_result,
-                          gpointer      user_data)
-{
-  GrdDaemonHandover *daemon_handover;
-  g_autoptr (GError) error = NULL;
-  GrdPromptResponse response;
-
-  if (!grd_prompt_query_finish (GRD_PROMPT (source_object),
-                                async_result,
-                                &response,
-                                &error))
-    {
-      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-        {
-          daemon_handover = GRD_DAEMON_HANDOVER (user_data);
-
-          g_warning ("Failed to query user about session: %s", error->message);
-          grd_session_stop (daemon_handover->session);
-        }
-
-      return;
-    }
-
-  daemon_handover = GRD_DAEMON_HANDOVER (user_data);
-
-  switch (response)
-    {
-    case GRD_PROMPT_RESPONSE_ACCEPT:
-      return;
-    case GRD_PROMPT_RESPONSE_CANCEL:
-      grd_session_stop (daemon_handover->session);
-      return;
-    }
-
-  g_assert_not_reached ();
-}
-
-static void
-show_insecure_connection_prompt (GrdDaemonHandover *daemon_handover)
-{
-  g_autoptr (GrdPromptDefinition) prompt_definition = NULL;
-
-  g_assert (!daemon_handover->prompt);
-
-  daemon_handover->prompt = g_object_new (GRD_TYPE_PROMPT, NULL);
-  daemon_handover->prompt_cancellable = g_cancellable_new ();
-
-  prompt_definition = g_new0 (GrdPromptDefinition, 1);
-  prompt_definition->summary =
-    g_strdup_printf (_("Continue With Insecure Connection?"));
-  prompt_definition->body =
-  /* Translators: Don't translate “use redirection server name:i:1”.
-   * It's a menu option, and it's the same for all languages. */
-    g_strdup_printf (_("This Remote Desktop connection is insecure. "
-                       "To secure this connection, enable RDSTLS Security "
-                       "in your client by saving the connection settings "
-                       "in your client as an RDP file and set "
-                       "“use redirection server name:i:1” in it."));
-  prompt_definition->cancel_label = g_strdup_printf (_("Disconnect"));
-  prompt_definition->accept_label = g_strdup_printf (_("Continue"));
-
-  grd_prompt_query_async (daemon_handover->prompt,
-                          prompt_definition,
-                          daemon_handover->prompt_cancellable,
-                          prompt_response_callback,
-                          daemon_handover);
-}
-
 static void
 inform_about_insecure_connection (GrdDaemonHandover *daemon_handover)
 {
-  gboolean could_display_dialog;
-
-  could_display_dialog = show_insecure_connection_dialog (daemon_handover);
-  if (!could_display_dialog)
-    show_insecure_connection_prompt (daemon_handover);
+  /* mstsc-class clients never request RDSTLS, so this fired on every
+   * remote login and blocked the handover until it was answered. The
+   * handover connection is TLS protected (RdstlsSecurity is enabled in
+   * grd_session_rdp_start), so only log it now.
+   */
+  g_message ("[DaemonHandover] Connection uses system credentials without "
+             "RDSTLS, continuing without confirmation");
 }
 
 static void
@@ -885,15 +782,6 @@ grd_daemon_handover_shutdown (GApplication *app)
 
   g_clear_handle_id (&daemon_handover->gnome_remote_desktop_watch_name_id,
                      g_bus_unwatch_name);
-
-  if (daemon_handover->prompt_cancellable)
-    {
-      g_cancellable_cancel (daemon_handover->prompt_cancellable);
-      g_clear_object (&daemon_handover->prompt_cancellable);
-    }
-  g_clear_object (&daemon_handover->prompt);
-
-  g_clear_object (&daemon_handover->dialog);
 
   G_APPLICATION_CLASS (grd_daemon_handover_parent_class)->shutdown (app);
 }
