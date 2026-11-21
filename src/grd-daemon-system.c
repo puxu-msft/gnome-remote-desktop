@@ -380,6 +380,9 @@ on_handle_start_handover (GrdDBusRemoteDesktopRdpHandover *interface,
 
   routing_token = get_routing_token_from_id (remote_client->id);
 
+  g_message ("[DaemonSystem] StartHandover: is_client_mstsc=%d",
+             remote_client->is_client_mstsc);
+
   g_object_get (G_OBJECT (settings),
                 "rdp-server-cert", &certificate,
                 "rdp-server-key", &key,
