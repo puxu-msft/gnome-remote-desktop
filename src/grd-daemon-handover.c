@@ -305,6 +305,23 @@ start_handover (GrdDaemonHandover *daemon_handover)
     daemon_handover);
 }
 
+static char *
+get_own_session_id (void)
+{
+  char *session_id;
+
+  session_id = grd_get_session_id_from_pid (getpid ());
+  if (session_id)
+    return session_id;
+
+  /*
+   * The handover daemon runs as a systemd user service, which is not part of
+   * any login session. Resolve the session the same way the system daemon
+   * resolves the session of a handover caller.
+   */
+  return grd_get_session_id_from_uid (getuid ());
+}
+
 static void
 on_session_stopped (GrdSession        *session,
                     GrdDaemonHandover *daemon_handover)
@@ -478,7 +495,7 @@ on_handover_object_added (GDBusObjectManager *manager,
   const char *object_path;
   GCancellable *cancellable;
 
-  session_id = grd_get_session_id_from_pid (getpid ());
+  session_id = get_own_session_id ();
   if (!session_id)
     {
       g_warning ("[DaemonHandover] Could not get session id");
