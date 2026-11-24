@@ -26,6 +26,8 @@
 
 #include <gio/gunixfdlist.h>
 #include <glib/gi18n.h>
+#include <glib/gstdio.h>
+#include <systemd/sd-login.h>
 #include <unistd.h>
 
 #include "grd-context.h"
@@ -53,6 +55,14 @@ struct _GrdDaemonHandover
   gboolean use_system_credentials;
 
   unsigned int gnome_remote_desktop_watch_name_id;
+
+  /*
+   * Only used while a remote client uses a session that was started on a
+   * local seat, see begin_local_seat_takeover().
+   */
+  GCancellable *takeover_cancellable;
+  GDBusProxy *login_session_proxy;
+  int sleep_inhibitor_fd;
 };
 
 G_DEFINE_TYPE (GrdDaemonHandover, grd_daemon_handover, GRD_TYPE_DAEMON)
@@ -322,6 +332,253 @@ get_own_session_id (void)
   return grd_get_session_id_from_uid (getuid ());
 }
 
+static gboolean
+is_session_on_local_seat (const char *session_id)
+{
+  g_autofree char *seat = NULL;
+
+  if (sd_session_get_seat (session_id, &seat) < 0)
+    return FALSE;
+
+  return sd_session_is_remote (session_id) == 0;
+}
+
+static void
+stop_session_if_seat_reclaimed (GrdDaemonHandover *daemon_handover)
+{
+  g_autoptr (GVariant) active = NULL;
+
+  if (!daemon_handover->session)
+    return;
+
+  active = g_dbus_proxy_get_cached_property (daemon_handover->login_session_proxy,
+                                             "Active");
+  if (!active || !g_variant_get_boolean (active))
+    return;
+
+  g_message ("[DaemonHandover] Session is active on its local seat, "
+             "disconnecting the remote client");
+
+  grd_session_stop (daemon_handover->session);
+}
+
+static void
+on_login_session_properties_changed (GDBusProxy        *proxy,
+                                     GVariant          *changed_properties,
+                                     GStrv              invalidated_properties,
+                                     GrdDaemonHandover *daemon_handover)
+{
+  gboolean active;
+
+  if (!g_variant_lookup (changed_properties, "Active", "b", &active) || !active)
+    return;
+
+  stop_session_if_seat_reclaimed (daemon_handover);
+}
+
+static void
+on_login_session_proxy_acquired (GObject      *source_object,
+                                 GAsyncResult *result,
+                                 gpointer      user_data)
+{
+  GrdDaemonHandover *daemon_handover;
+  g_autoptr (GDBusProxy) proxy = NULL;
+  g_autoptr (GError) error = NULL;
+
+  proxy = g_dbus_proxy_new_finish (result, &error);
+  if (!proxy)
+    {
+      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        g_warning ("[DaemonHandover] Failed to watch login session: %s",
+                   error->message);
+      return;
+    }
+
+  daemon_handover = GRD_DAEMON_HANDOVER (user_data);
+  if (!daemon_handover->takeover_cancellable ||
+      daemon_handover->login_session_proxy)
+    return;
+
+  daemon_handover->login_session_proxy = g_steal_pointer (&proxy);
+  g_signal_connect (daemon_handover->login_session_proxy,
+                    "g-properties-changed",
+                    G_CALLBACK (on_login_session_properties_changed),
+                    daemon_handover);
+
+  /*
+   * GDM detaches the session from its seat before handing the client over.
+   * If that did not happen, the remote client must not be served, as the
+   * session would still be visible and usable on the local seat.
+   */
+  stop_session_if_seat_reclaimed (daemon_handover);
+}
+
+static void
+on_get_login_session_finished (GObject      *source_object,
+                               GAsyncResult *result,
+                               gpointer      user_data)
+{
+  GDBusConnection *connection = G_DBUS_CONNECTION (source_object);
+  GrdDaemonHandover *daemon_handover;
+  g_autoptr (GVariant) reply = NULL;
+  g_autoptr (GError) error = NULL;
+  const char *object_path;
+
+  reply = g_dbus_connection_call_finish (connection, result, &error);
+  if (!reply)
+    {
+      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        g_warning ("[DaemonHandover] Failed to look up login session: %s",
+                   error->message);
+      return;
+    }
+
+  daemon_handover = GRD_DAEMON_HANDOVER (user_data);
+  if (!daemon_handover->takeover_cancellable)
+    return;
+
+  g_variant_get (reply, "(&o)", &object_path);
+
+  g_dbus_proxy_new (connection,
+                    G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
+                    NULL,
+                    "org.freedesktop.login1",
+                    object_path,
+                    "org.freedesktop.login1.Session",
+                    daemon_handover->takeover_cancellable,
+                    on_login_session_proxy_acquired,
+                    daemon_handover);
+}
+
+static void
+on_inhibit_sleep_finished (GObject      *source_object,
+                           GAsyncResult *result,
+                           gpointer      user_data)
+{
+  GrdDaemonHandover *daemon_handover;
+  g_autoptr (GUnixFDList) fd_list = NULL;
+  g_autoptr (GVariant) reply = NULL;
+  g_autoptr (GError) error = NULL;
+  g_autofd int fd = -1;
+  int fd_idx;
+
+  reply = g_dbus_connection_call_with_unix_fd_list_finish (
+            G_DBUS_CONNECTION (source_object), &fd_list, result, &error);
+  if (!reply)
+    {
+      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        g_warning ("[DaemonHandover] Failed to inhibit sleep: %s",
+                   error->message);
+      return;
+    }
+
+  g_variant_get (reply, "(h)", &fd_idx);
+  fd = g_unix_fd_list_get (fd_list, fd_idx, &error);
+  if (fd == -1)
+    {
+      g_warning ("[DaemonHandover] Failed to get sleep inhibitor: %s",
+                 error->message);
+      return;
+    }
+
+  daemon_handover = GRD_DAEMON_HANDOVER (user_data);
+  if (!daemon_handover->takeover_cancellable ||
+      daemon_handover->sleep_inhibitor_fd != -1)
+    return;
+
+  daemon_handover->sleep_inhibitor_fd = g_steal_fd (&fd);
+}
+
+/*
+ * A remote client was handed over to a session that was started on a local
+ * seat (GDM emitted ActivateSession for it). While the client uses the
+ * session, the seat shows the login screen, so the session is inactive:
+ *
+ * - GDM only inhibits sleep while remote displays exist, and the login screen
+ *   on the seat would suspend the machine once idle, so sleep is inhibited
+ *   here instead.
+ * - When the user logs back in on the seat, GDM activates the session there
+ *   again and the remote client is disconnected.
+ */
+static void
+begin_local_seat_takeover (GrdDaemonHandover *daemon_handover)
+{
+  g_autoptr (GDBusConnection) connection = NULL;
+  g_autofree char *session_id = NULL;
+  g_autoptr (GError) error = NULL;
+
+  if (daemon_handover->takeover_cancellable)
+    return;
+
+  session_id = get_own_session_id ();
+  if (!session_id || !is_session_on_local_seat (session_id))
+    return;
+
+  connection = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, &error);
+  if (!connection)
+    {
+      g_warning ("[DaemonHandover] Failed to get system bus: %s",
+                 error->message);
+      return;
+    }
+
+  g_message ("[DaemonHandover] Remote client uses session %s of a local seat",
+             session_id);
+
+  daemon_handover->takeover_cancellable = g_cancellable_new ();
+
+  g_dbus_connection_call (connection,
+                          "org.freedesktop.login1",
+                          "/org/freedesktop/login1",
+                          "org.freedesktop.login1.Manager",
+                          "GetSession",
+                          g_variant_new ("(s)", session_id),
+                          G_VARIANT_TYPE ("(o)"),
+                          G_DBUS_CALL_FLAGS_NONE,
+                          -1,
+                          daemon_handover->takeover_cancellable,
+                          on_get_login_session_finished,
+                          daemon_handover);
+
+  g_dbus_connection_call_with_unix_fd_list (connection,
+                                            "org.freedesktop.login1",
+                                            "/org/freedesktop/login1",
+                                            "org.freedesktop.login1.Manager",
+                                            "Inhibit",
+                                            g_variant_new ("(ssss)",
+                                                           "sleep",
+                                                           "GNOME Remote Desktop",
+                                                           "A remote client is using a session of this seat",
+                                                           "block"),
+                                            G_VARIANT_TYPE ("(h)"),
+                                            G_DBUS_CALL_FLAGS_NONE,
+                                            -1,
+                                            NULL,
+                                            daemon_handover->takeover_cancellable,
+                                            on_inhibit_sleep_finished,
+                                            daemon_handover);
+}
+
+static void
+end_local_seat_takeover (GrdDaemonHandover *daemon_handover)
+{
+  if (!daemon_handover->takeover_cancellable)
+    return;
+
+  g_cancellable_cancel (daemon_handover->takeover_cancellable);
+  g_clear_object (&daemon_handover->takeover_cancellable);
+
+  if (daemon_handover->login_session_proxy)
+    {
+      g_signal_handlers_disconnect_by_func (daemon_handover->login_session_proxy,
+                                            G_CALLBACK (on_login_session_properties_changed),
+                                            daemon_handover);
+      g_clear_object (&daemon_handover->login_session_proxy);
+    }
+
+  g_clear_fd (&daemon_handover->sleep_inhibitor_fd, NULL);
+}
+
 static void
 on_session_stopped (GrdSession        *session,
                     GrdDaemonHandover *daemon_handover)
@@ -330,6 +587,8 @@ on_session_stopped (GrdSession        *session,
     grd_session_manager_call_logout_sync ();
 
   daemon_handover->session = NULL;
+
+  end_local_seat_takeover (daemon_handover);
 }
 
 static void
@@ -409,6 +668,8 @@ on_incoming_new_connection (GrdRdpServer      *rdp_server,
                     daemon_handover);
 
   daemon_handover->session = session;
+
+  begin_local_seat_takeover (daemon_handover);
 
   grd_settings_recreate_rdp_credentials (settings);
 
@@ -763,6 +1024,7 @@ grd_daemon_handover_new (GError **error)
 static void
 grd_daemon_handover_init (GrdDaemonHandover *daemon_handover)
 {
+  daemon_handover->sleep_inhibitor_fd = -1;
 }
 
 static void
@@ -799,6 +1061,8 @@ grd_daemon_handover_shutdown (GApplication *app)
   GrdDaemon *daemon = GRD_DAEMON (daemon_handover);
 
   g_cancellable_cancel (grd_daemon_get_cancellable (daemon));
+
+  end_local_seat_takeover (daemon_handover);
 
   g_clear_object (&daemon_handover->remote_desktop_handover);
   g_clear_object (&daemon_handover->remote_desktop_dispatcher);
