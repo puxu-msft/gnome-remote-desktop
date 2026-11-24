@@ -254,6 +254,14 @@ on_start_handover_finished (GObject      *object,
 
       g_warning ("[DaemonHandover] Failed to start handover: %s",
                  error->message);
+
+      /*
+       * The client of a remote login screen only arrives through this
+       * handover, e.g. it fails when the client disconnected while the login
+       * screen was starting. Nothing can reach the login screen afterwards.
+       */
+      if (grd_is_remote_login ())
+        grd_session_manager_call_logout_sync ();
       return;
     }
 
