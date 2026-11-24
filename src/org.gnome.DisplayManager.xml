@@ -6,6 +6,9 @@
     <method name="SetRemoteId">
       <arg name="remote_id" direction="in" type="o"/>
     </method>
+    <signal name="ActivateSession">
+      <arg name="session_id" type="s"/>
+    </signal>
   </interface>
   <interface name="org.gnome.DisplayManager.RemoteDisplayFactory">
     <method name="CreateRemoteDisplay">

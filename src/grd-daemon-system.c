@@ -61,6 +61,7 @@ typedef struct
   HandoverInterface *handover_dst;
 
   unsigned int abort_handover_source_id;
+  unsigned int activate_session_watchdog_id;
 
   gboolean is_client_mstsc;
   gboolean use_system_credentials;
@@ -106,6 +107,11 @@ on_gdm_remote_display_session_id_changed (GrdDBusGdmRemoteDisplay *remote_displa
                                           GrdRemoteClient         *remote_client);
 
 static void
+on_remote_display_activate_session (GrdDBusGdmRemoteDisplay *remote_display,
+                                    const char              *session_id,
+                                    GrdRemoteClient         *remote_client);
+
+static void
 session_disposed (GrdRemoteClient *remote_client);
 
 static void
@@ -119,6 +125,9 @@ disconnect_from_remote_display (GrdRemoteClient *remote_client)
                                         remote_client);
   g_signal_handlers_disconnect_by_func (remote_client->remote_display,
                                         G_CALLBACK (on_gdm_remote_display_session_id_changed),
+                                        remote_client);
+  g_signal_handlers_disconnect_by_func (remote_client->remote_display,
+                                        G_CALLBACK (on_remote_display_activate_session),
                                         remote_client);
 
   g_clear_object (&remote_client->remote_display);
@@ -428,6 +437,9 @@ on_handle_start_handover (GrdDBusRemoteDesktopRdpHandover *interface,
   sender = g_dbus_method_invocation_get_sender (invocation);
   remote_client->handover_dst->sender_name = g_strdup (sender);
 
+  g_clear_handle_id (&remote_client->activate_session_watchdog_id,
+                     g_source_remove);
+
   grd_dbus_remote_desktop_rdp_handover_complete_start_handover (
     remote_client->handover_dst->interface,
     invocation,
@@ -598,6 +610,7 @@ grd_remote_client_free (GrdRemoteClient *remote_client)
   g_clear_pointer (&remote_client->handover_src, handover_iface_free);
   g_clear_pointer (&remote_client->handover_dst, handover_iface_free);
   g_clear_handle_id (&remote_client->abort_handover_source_id, g_source_remove);
+  g_clear_handle_id (&remote_client->activate_session_watchdog_id, g_source_remove);
 
   g_free (remote_client);
 }
@@ -1079,6 +1092,94 @@ on_remote_display_remote_id_changed (GrdDBusGdmRemoteDisplay *remote_display,
   g_hash_table_remove (daemon_system->remote_clients, remote_client->id);
 }
 
+static GrdRemoteClient *
+find_remote_client_by_handover_dst (GrdDaemonSystem *daemon_system,
+                                    const char      *object_path)
+{
+  GrdRemoteClient *remote_client;
+  GHashTableIter iter;
+
+  g_hash_table_iter_init (&iter, daemon_system->remote_clients);
+  while (g_hash_table_iter_next (&iter, NULL, (gpointer *) &remote_client))
+    {
+      if (remote_client->handover_dst &&
+          g_str_equal (remote_client->handover_dst->object_path, object_path))
+        return remote_client;
+    }
+
+  return NULL;
+}
+
+/*
+ * The client stays on the login screen until a handover daemon in the target
+ * session starts the handover, which still completes the takeover if that
+ * daemon only shows up later. As the login screen gives no feedback
+ * meanwhile, point out the likely cause.
+ */
+static void
+on_activate_session_watchdog (gpointer user_data)
+{
+  GrdRemoteClient *remote_client = user_data;
+
+  remote_client->activate_session_watchdog_id = 0;
+
+  g_warning ("[DaemonSystem] Nobody started the handover at %s for remote "
+             "client with remote id %s yet, is "
+             "gnome-remote-desktop-handover.service running in that session?",
+             remote_client->handover_dst->object_path, remote_client->id);
+}
+
+/*
+ * GDM emits ActivateSession on the login screen's remote display when the
+ * user re-authenticated there against a session without a remote display of
+ * its own, i.e. a session that was started on a local seat. The client is
+ * handed over from the login screen to that session. A remote client left
+ * over from an earlier takeover of the same session still owns the handover
+ * interface for it, so it is taken over like on a remote id change.
+ */
+static void
+on_remote_display_activate_session (GrdDBusGdmRemoteDisplay *remote_display,
+                                    const char              *session_id,
+                                    GrdRemoteClient         *remote_client)
+{
+  GrdDaemonSystem *daemon_system = remote_client->daemon_system;
+  GrdRemoteClient *previous_remote_client;
+  g_autofree char *object_path = NULL;
+
+  g_debug ("[DaemonSystem] GDM asked to activate session %s for remote "
+           "client with remote id %s", session_id, remote_client->id);
+
+  object_path = g_strdup_printf ("%s/session%s",
+                                 REMOTE_DESKTOP_HANDOVERS_OBJECT_PATH,
+                                 session_id);
+
+  previous_remote_client = find_remote_client_by_handover_dst (daemon_system,
+                                                               object_path);
+  if (previous_remote_client == remote_client)
+    return;
+
+  if (previous_remote_client)
+    {
+      steal_handover_from_client (remote_client, previous_remote_client);
+      g_hash_table_remove (daemon_system->remote_clients,
+                           previous_remote_client->id);
+    }
+  else
+    {
+      register_handover_iface (remote_client, session_id);
+    }
+
+  grd_dbus_remote_desktop_rdp_handover_set_handover_is_waiting (
+    remote_client->handover_dst->interface, TRUE);
+
+  g_clear_handle_id (&remote_client->activate_session_watchdog_id,
+                     g_source_remove);
+  remote_client->activate_session_watchdog_id =
+    g_timeout_add_seconds_once (MAX_HANDOVER_WAIT_TIME_S,
+                                on_activate_session_watchdog,
+                                remote_client);
+}
+
 static void
 on_gdm_remote_display_session_id_changed (GrdDBusGdmRemoteDisplay *remote_display,
                                           GParamSpec              *pspec,
@@ -1203,6 +1304,9 @@ register_handover_for_display (GrdDaemonSystem         *daemon_system,
 
   disconnect_from_remote_display (remote_client);
   remote_client->remote_display = g_object_ref (remote_display);
+  g_signal_connect (remote_display, "activate-session",
+                    G_CALLBACK (on_remote_display_activate_session),
+                    remote_client);
 
   session_id = grd_dbus_gdm_remote_display_get_session_id (remote_display);
   if (!session_id || strcmp (session_id, "") == 0)
