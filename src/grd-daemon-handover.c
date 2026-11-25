@@ -26,7 +26,6 @@
 
 #include <gio/gunixfdlist.h>
 #include <glib/gi18n.h>
-#include <glib/gstdio.h>
 #include <systemd/sd-login.h>
 #include <unistd.h>
 
@@ -62,7 +61,6 @@ struct _GrdDaemonHandover
    */
   GCancellable *takeover_cancellable;
   GDBusProxy *login_session_proxy;
-  int sleep_inhibitor_fd;
 };
 
 G_DEFINE_TYPE (GrdDaemonHandover, grd_daemon_handover, GRD_TYPE_DAEMON)
@@ -450,55 +448,13 @@ on_get_login_session_finished (GObject      *source_object,
                     daemon_handover);
 }
 
-static void
-on_inhibit_sleep_finished (GObject      *source_object,
-                           GAsyncResult *result,
-                           gpointer      user_data)
-{
-  GrdDaemonHandover *daemon_handover;
-  g_autoptr (GUnixFDList) fd_list = NULL;
-  g_autoptr (GVariant) reply = NULL;
-  g_autoptr (GError) error = NULL;
-  g_autofd int fd = -1;
-  int fd_idx;
-
-  reply = g_dbus_connection_call_with_unix_fd_list_finish (
-            G_DBUS_CONNECTION (source_object), &fd_list, result, &error);
-  if (!reply)
-    {
-      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-        g_warning ("[DaemonHandover] Failed to inhibit sleep: %s",
-                   error->message);
-      return;
-    }
-
-  g_variant_get (reply, "(h)", &fd_idx);
-  fd = g_unix_fd_list_get (fd_list, fd_idx, &error);
-  if (fd == -1)
-    {
-      g_warning ("[DaemonHandover] Failed to get sleep inhibitor: %s",
-                 error->message);
-      return;
-    }
-
-  daemon_handover = GRD_DAEMON_HANDOVER (user_data);
-  if (!daemon_handover->takeover_cancellable ||
-      daemon_handover->sleep_inhibitor_fd != -1)
-    return;
-
-  daemon_handover->sleep_inhibitor_fd = g_steal_fd (&fd);
-}
-
 /*
  * A remote client was handed over to a session that was started on a local
  * seat (GDM emitted ActivateSession for it). While the client uses the
- * session, the seat shows the login screen, so the session is inactive:
- *
- * - GDM only inhibits sleep while remote displays exist, and the login screen
- *   on the seat would suspend the machine once idle, so sleep is inhibited
- *   here instead.
- * - When the user logs back in on the seat, GDM activates the session there
- *   again and the remote client is disconnected.
+ * session, the seat shows the login screen, so the session is inactive. When
+ * the user logs back in on the seat, GDM activates the session there again,
+ * and the remote client is disconnected. GDM also keeps sleep inhibited for
+ * as long as the session is taken over, independent of this daemon.
  */
 static void
 begin_local_seat_takeover (GrdDaemonHandover *daemon_handover)
@@ -539,24 +495,6 @@ begin_local_seat_takeover (GrdDaemonHandover *daemon_handover)
                           daemon_handover->takeover_cancellable,
                           on_get_login_session_finished,
                           daemon_handover);
-
-  g_dbus_connection_call_with_unix_fd_list (connection,
-                                            "org.freedesktop.login1",
-                                            "/org/freedesktop/login1",
-                                            "org.freedesktop.login1.Manager",
-                                            "Inhibit",
-                                            g_variant_new ("(ssss)",
-                                                           "sleep",
-                                                           "GNOME Remote Desktop",
-                                                           "A remote client is using a session of this seat",
-                                                           "block"),
-                                            G_VARIANT_TYPE ("(h)"),
-                                            G_DBUS_CALL_FLAGS_NONE,
-                                            -1,
-                                            NULL,
-                                            daemon_handover->takeover_cancellable,
-                                            on_inhibit_sleep_finished,
-                                            daemon_handover);
 }
 
 static void
@@ -575,8 +513,6 @@ end_local_seat_takeover (GrdDaemonHandover *daemon_handover)
                                             daemon_handover);
       g_clear_object (&daemon_handover->login_session_proxy);
     }
-
-  g_clear_fd (&daemon_handover->sleep_inhibitor_fd, NULL);
 }
 
 static void
@@ -1024,7 +960,6 @@ grd_daemon_handover_new (GError **error)
 static void
 grd_daemon_handover_init (GrdDaemonHandover *daemon_handover)
 {
-  daemon_handover->sleep_inhibitor_fd = -1;
 }
 
 static void
